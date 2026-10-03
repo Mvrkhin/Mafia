@@ -28,25 +28,45 @@
 })();
 </script>
 <script>
-/* ---- Per-Telegram-account storage isolation (v2) ----
-   Every Telegram account on one device shares the same WebView origin, so the same localStorage /
-   IndexedDB. The current account's id is read synchronously from the launch params and every
-   localStorage key is namespaced with it, so each account gets its own data.
-   v2: original Storage methods are captured first; if replacing window.localStorage is refused by the
-   WebView, Storage.prototype is patched instead (so accounts can never silently share data); legacy
-   data is MOVED (not copied) to the first account, so it no longer doubles the storage use; and
-   window.__MU_PREFIX lets the app ignore 'storage' events that come from other accounts.
+/* ---- Per-Telegram-account + per-bot/app storage isolation (v3) ----
+   Layer 1 (account): every Telegram account on one device shares the same WebView origin, so the same
+   localStorage / IndexedDB. The account id is read synchronously from the launch params (URL ->
+   Telegram's cached params in sessionStorage -> live SDK -> id remembered for this tab).
+   Layer 2 (bot/app): two bots (or two URLs) opened by the SAME account still share one origin, and
+   Telegram never says which bot launched the app, so the app's own address is its identity: the page
+   path plus an optional ?bot=NAME in the URL (for the same URL used by two bots). Each
+   (account + app/bot) pair gets a private keyspace: localStorage 'mu_sc_<account>_<scope>_' and the
+   IndexedDB backup 'nhc_backup_acct_<account>_s_<scope>'.
+   Kept from v2: original Storage methods are captured first, and if the WebView refuses to replace
+   window.localStorage, Storage.prototype is patched instead (accounts can never silently share data).
+   Migrations only ever touch this game's own keys (nhc_*, lang, sfx, mus, ntf, inb, vib), so other
+   apps on the same origin (e.g. the notes app) are never moved or damaged. Old data is MOVED, not
+   copied, so it never doubles the storage use.
+   window.__MU_PREFIX lets the app ignore 'storage' events written by another account or bot.
    No id available (opened outside Telegram) -> storage is left untouched. */
 (function(){
- window.__MU_ACCT_ID=null;window.__MU_PREFIX='';window.__MU_LEGACY_CLAIMED_BY_ME=false;
+ window.__MU_ACCT_ID=null;window.__MU_SCOPE_ID=null;window.__MU_PREFIX='';
+ window.__MU_LEGACY_CLAIMED_BY_ME=false;window.__MU_SCOPE_CLAIMED_BY_ME=false;window.__MU_SCOPED=false;
  function parse(str){var o={};if(!str)return o;str.split('&').forEach(function(kv){if(!kv)return;var e=kv.indexOf('='),k=e<0?kv:kv.slice(0,e),v=e<0?'':kv.slice(e+1);try{k=decodeURIComponent(k);}catch(x){}try{v=decodeURIComponent(v);}catch(x){}o[k]=v;});return o;}
  function fromData(raw){try{if(!raw)return null;var u=parse(raw).user;if(!u)return null;var j=JSON.parse(u);return(j&&j.id!=null)?String(j.id):null;}catch(e){return null;}}
  function readId(){
   var r=null;
   try{r=fromData(parse((location.hash||'').replace(/^#/,'')).tgWebAppData)||fromData(parse((location.search||'').replace(/^\?/,'')).tgWebAppData);}catch(e){}
-  if(r)return r;
-  try{var w=window.Telegram&&window.Telegram.WebApp;if(w){if(w.initDataUnsafe&&w.initDataUnsafe.user&&w.initDataUnsafe.user.id!=null)return String(w.initDataUnsafe.user.id);r=fromData(w.initData);if(r)return r;}}catch(e){}
-  return null;
+  if(!r){try{var c=window.sessionStorage.getItem('__telegram__initParams');if(c)r=fromData((JSON.parse(c)||{}).tgWebAppData);}catch(e){}}   // an in-app reload dropped the URL hash
+  if(!r){try{var w=window.Telegram&&window.Telegram.WebApp;if(w){if(w.initDataUnsafe&&w.initDataUnsafe.user&&w.initDataUnsafe.user.id!=null)r=String(w.initDataUnsafe.user.id);else r=fromData(w.initData);}}catch(e){}}
+  if(r){try{window.sessionStorage.setItem('__mu_acct_id__',r);}catch(e){}}   // same tab, later reload without params: same account
+  else{try{r=window.sessionStorage.getItem('__mu_acct_id__')||null;}catch(e){}}
+  return r;
+ }
+ function hash53(s){var h1=0xdeadbeef,h2=0x41c6ce57;for(var i=0,c;i<s.length;i++){c=s.charCodeAt(i);h1=Math.imul(h1^c,2654435761);h2=Math.imul(h2^c,1597334677);}
+  h1=Math.imul(h1^(h1>>>16),2246822507)^Math.imul(h2^(h2>>>13),3266489909);h2=Math.imul(h2^(h2>>>16),2246822507)^Math.imul(h1^(h1>>>13),3266489909);
+  return(4294967296*(2097151&h2)+(h1>>>0)).toString(36);}
+ function readScope(){
+  var p='/';try{p=String(location.pathname||'/');}catch(e){}
+  try{p=decodeURIComponent(p);}catch(e){}
+  p=p.toLowerCase().replace(/\/index\.html?$/,'').replace(/\/+$/,'');
+  var b='';try{b=String(parse((location.search||'').replace(/^\?/,'')).bot||'').toLowerCase().replace(/[^a-z0-9_-]/g,'').slice(0,40);}catch(e){}
+  return hash53(p+'|'+b);
  }
  var id=readId();
  if(!id||!/^[0-9A-Za-z_-]{1,32}$/.test(id))return;
@@ -57,19 +77,32 @@
      lenD=SP&&Object.getOwnPropertyDescriptor(SP,'length');
  function rawLen(){try{return lenD&&lenD.get?lenD.get.call(real):real.length;}catch(e){return 0;}}
  function rg(k){return G.call(real,k);} function rs(k,v){S_.call(real,k,v);} function rr(k){R_.call(real,k);} function rk(i){return K_.call(real,i);}
- var pre='mu_acct_'+id+'_';
- window.__MU_ACCT_ID=id;window.__MU_PREFIX=pre;
- // One-time migration: the first account to open the app after this update inherits the old shared data.
- // Keys are moved one by one (copy, then delete the old key), so the extra space is freed right away.
+ var scope=readScope(), pre1='mu_acct_'+id+'_', pre='mu_sc_'+id+'_'+scope+'_';
+ window.__MU_ACCT_ID=id;window.__MU_SCOPE_ID=scope;window.__MU_PREFIX=pre;
+ function mine(k){return /^(nhc_|lang$|sfx$|mus$|ntf$|inb$|vib$)/.test(k);}   // this game's own keys only
+ function moveKeys(fromPre,toPre,copyOnly){   // returns how many keys were moved; one by one so space is freed right away
+  var ks=[],n=0;
+  for(var i=0,l=rawLen();i<l;i++){var k=rk(i);if(k&&k.indexOf(fromPre)===0&&mine(k.slice(fromPre.length)))ks.push(k);}
+  ks.forEach(function(k){try{var v=rg(k);if(v!==null){var nk=toPre+k.slice(fromPre.length);if(rg(nk)===null)rs(nk,v);if(!copyOnly)rr(k);n++;}}catch(e){}});
+  return n;
+ }
+ // Step 1 - old shared (unprefixed) data goes to the first account that opens the game after the update.
  try{
-  var CLAIM='__mu_legacy_claimed_v1__';
-  if(rg(CLAIM)!=='1'){
-   window.__MU_LEGACY_CLAIMED_BY_ME=true;
-   var old=[];
-   for(var i=0,n=rawLen();i<n;i++){var k=rk(i);if(k&&k.indexOf('mu_acct_')!==0&&k!==CLAIM)old.push(k);}
-   old.forEach(function(k){try{var v=rg(k);if(v!==null){rs(pre+k,v);rr(k);}}catch(e){}});
-   rs(CLAIM,'1');
+  var LCK='__mu_nhc_legacy_v3__', lo=rg(LCK);
+  if(lo===null){
+   var raw=[];for(var i=0,l=rawLen();i<l;i++){var k=rk(i);if(k&&mine(k))raw.push(k);}
+   var moved=0;
+   raw.forEach(function(k){try{var v=rg(k);if(v!==null){rs(pre1+k,v);if(k.indexOf('nhc_')===0)rr(k);moved++;}}catch(e){}});   // game data moves; tiny prefs are copied
+   lo=moved>0?id:'-';rs(LCK,lo);
   }
+  window.__MU_LEGACY_CLAIMED_BY_ME=(lo===id);
+ }catch(e){}
+ // Step 2 - the first app/bot of this account to open after the update inherits the account's existing data
+ // (layer 1 -> layer 2). Every other bot / URL starts clean.
+ try{
+  var SCK='__mu_nhc_scope_v3_'+id, so=rg(SCK);
+  if(so===null){moveKeys(pre1,pre,false);rs(SCK,scope);so=scope;}
+  window.__MU_SCOPE_CLAIMED_BY_ME=(so===scope);
  }catch(e){}
  function own(){var a=[];for(var i=0,n=rawLen();i<n;i++){var k=rk(i);if(k&&k.indexOf(pre)===0)a.push(k.slice(pre.length));}return a;}
  var scoped={
@@ -905,29 +938,41 @@ M.trMsg=trMsg;
 // before the game boots; Telegram CloudStorage (below) then pulls anything newer from the account.
 // Deletions are mirrored too, so removed rooms never come back. Any failure just means "no backup".
 var Idb=(function(){
- var PFX='nhc_', LEGACY_DBN='nhc_backup', DBN=window.__MU_ACCT_ID?(LEGACY_DBN+'_acct_'+window.__MU_ACCT_ID):LEGACY_DBN, ST='kv', db=null, last={}, busy=false;
+ var PFX='nhc_', LEGACY_DBN='nhc_backup', ST='kv', db=null, last={}, busy=false;
+ // one backup DB per (Telegram account + app/bot); layer-1 name = per account only (previous version)
+ var ACCT_DBN=window.__MU_ACCT_ID?(LEGACY_DBN+'_acct_'+window.__MU_ACCT_ID):LEGACY_DBN;
+ var DBN=(window.__MU_ACCT_ID&&window.__MU_SCOPE_ID)?(ACCT_DBN+'_s_'+window.__MU_SCOPE_ID):ACCT_DBN;
  function keys(){var o={};try{for(var i=0;i<localStorage.length;i++){var k=localStorage.key(i);if(k&&k.indexOf(PFX)===0)o[k]=localStorage.getItem(k);}}catch(e){}return o;}
- function migrate(nd){return new Promise(function(res){   // first account inherits the old shared backup DB
+ function migrate(nd,src){return new Promise(function(res){   // copy an older backup DB into the new one; resolves with the number of records copied
+  var n=0;
   try{
-   var r=indexedDB.open(LEGACY_DBN,1);
-   r.onupgradeneeded=function(){try{if(!r.result.objectStoreNames.contains(ST))r.result.createObjectStore(ST);}catch(e){}};
+   var r=indexedDB.open(src,1),absent=false;
+   // never create an empty DB just to look for old data: if it does not exist, abort the open
+   r.onupgradeneeded=function(e){if(e.oldVersion===0){absent=true;try{r.transaction.abort();}catch(x){}}};
    r.onsuccess=function(){
     try{
+     if(!r.result.objectStoreNames.contains(ST)){r.result.close();res(0);return;}
      var c=r.result.transaction(ST,'readonly').objectStore(ST).openCursor(),t=nd.transaction(ST,'readwrite'),ns=t.objectStore(ST);
-     c.onsuccess=function(){var x=c.result;if(x){try{ns.put(x.value,x.key);}catch(e){}x['continue']();}};
-     t.oncomplete=function(){res();};t.onerror=t.onabort=function(){res();};
-     c.onerror=function(){res();};
-    }catch(e){res();}
+     c.onsuccess=function(){var x=c.result;if(x){try{ns.put(x.value,x.key);n++;}catch(e){}x['continue']();}};
+     t.oncomplete=function(){try{r.result.close();}catch(e){}res(n);};t.onerror=t.onabort=function(){res(n);};
+     c.onerror=function(){res(n);};
+    }catch(e){res(n);}
    };
-   r.onerror=r.onblocked=function(){res();};
-  }catch(e){res();}
+   r.onerror=function(){res(0);};r.onblocked=function(){res(0);};
+  }catch(e){res(0);}
  });}
  function open(){return new Promise(function(res,rej){
   var q=indexedDB.open(DBN,1),isNew=false;
   q.onupgradeneeded=function(e){if(e.oldVersion===0)isNew=true;q.result.createObjectStore(ST);};
   q.onsuccess=function(){
-   if(isNew&&DBN!==LEGACY_DBN&&window.__MU_LEGACY_CLAIMED_BY_ME)migrate(q.result).then(function(){res(q.result);});
-   else res(q.result);
+   var nd=q.result;
+   if(!isNew||DBN===LEGACY_DBN){res(nd);return;}
+   // a brand-new DB inherits the older backups, but only when this app/bot owns that data
+   var p=Promise.resolve(0);
+   if(DBN!==ACCT_DBN&&window.__MU_SCOPE_CLAIMED_BY_ME)p=migrate(nd,ACCT_DBN);   // layer 1 -> layer 2
+   p.then(function(n){
+    if(!n&&window.__MU_LEGACY_CLAIMED_BY_ME)return migrate(nd,LEGACY_DBN);      // old shared DB -> first account
+   }).then(function(){res(nd);},function(){res(nd);});
   };
   q.onerror=function(){rej(q.error);};
   q.onblocked=function(){rej(new Error('blocked'));};
